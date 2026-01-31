@@ -78,22 +78,29 @@ def load_queue(path: str) -> list[dict]:
         if not str(mid).strip() or not str(text).strip():
             continue
 
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
         normalized_item = {
             "id": str(mid),
             "text": str(text),
             "priority": float(item.get("priority", 0.0) or 0.0),
             "created_at": item.get("created_at") or datetime.datetime.now().isoformat(timespec="seconds"),
             "group": item.get("group") or GROUP_NAME,
+            "meta": meta,
         }
 
         # route opcional (rate-limit por rota)
-        if item.get("route"):
-            normalized_item["route"] = item.get("route")
+        route = item.get("route") or meta.get("route")
+        if route:
+            normalized_item["route"] = route
         else:
-            o = item.get("origin")
-            d = item.get("dest")
+            o = item.get("origin") or meta.get("origin")
+            d = item.get("dest") or meta.get("dest")
             if o and d:
                 normalized_item["route"] = f"{o}-{d}"
+
+        price = item.get("min_price") or meta.get("min_price") or meta.get("price")
+        if isinstance(price, (int, float)):
+            normalized_item["price"] = int(price)
 
         normalized.append(normalized_item)
 
@@ -206,16 +213,28 @@ def is_within_send_window() -> bool:
     return False
 
 
-def can_send_now(group: str, route_key: str | None):
+def can_send_now(group: str, route_key: str | None, *, price: int | None, offer_hash: str | None):
     if not is_within_send_window():
         return False, "OUTSIDE_WINDOW"
 
-    ok, reason = can_send_group(group)
+    ok, reason = can_send_group(group, MIN_SECONDS_BETWEEN_MESSAGES_PER_GROUP)
     if not ok:
         return False, reason
 
+    if offer_hash and state_store.is_under_cooldown_link(offer_hash, cooldown_hours=settings.ALERT_COOLDOWN_HOURS):
+        return False, "OFFER_COOLDOWN"
+
     if route_key:
-        ok, reason = can_send_route(route_key)
+        ok, reason = can_send_route(route_key, settings.ROUTE_MIN_INTERVAL_SEC)
+        if not ok:
+            return False, reason
+
+        ok, reason, _ = state_store.can_send_route_daily(
+            route_key,
+            settings.DAILY_ROUTE_LIMIT,
+            price=price,
+            record_break_pct=settings.RECORD_BREAK_PCT,
+        )
         if not ok:
             return False, reason
 
@@ -293,8 +312,10 @@ def main():
                 item = items[i]
                 msg = item.get("text") or ""
                 route_key = item.get("route") if isinstance(item.get("route"), str) else None
+                price = item.get("price") if isinstance(item.get("price"), int) else None
 
-                allowed, reason = can_send_now(group, route_key)
+                offer_hash = item.get("id") or item.get("offer_hash")
+                allowed, reason = can_send_now(group, route_key, price=price, offer_hash=offer_hash)
                 if not allowed:
                     log("SEND", f"blocked reason={reason} group={group}")
                     break
@@ -317,6 +338,12 @@ def main():
                         state_store.mark_announced(offer_hash)
                     except Exception as e:
                         log("WARN", f"mark_announced falhou: {e}")
+
+                if route_key:
+                    try:
+                        state_store.record_route_send(route_key, price=price)
+                    except Exception as e:
+                        log("WARN", f"record_route_send falhou: {e}")
 
                 try:
                     state_store.record_group_send(group)

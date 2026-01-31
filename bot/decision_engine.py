@@ -22,6 +22,7 @@ from bot.message_builder import build_grouped_message
 from bot.queue_store import is_in_queue
 from bot.dedupe import make_offer_id, make_dedupe_key
 from bot.pricing_utils import parse_brl_to_int
+from bot import utils_viajala as VU
 import logging
 from dataclasses import dataclass
 from typing import Optional
@@ -103,34 +104,60 @@ def merge_offer(a: dict, b: dict) -> dict:
 
 
 def compute_confidence(o: dict) -> int:
-    c = 0
-    if _price_int_from_offer(o) is not None:
-        c += 40
-    if o.get("dep_time") and o.get("arr_time"):
-        c += 15
-    if isinstance(o.get("duration_min"), int) and o.get("duration_min") > 0:
-        c += 15
-    if o.get("airline"):
-        c += 10
-    if o.get("link"):
-        c += 10
-    extra = int(o.get("extra_offers") or o.get("extra_offers_count") or 0)
-    c += min(extra, 10)
-    return max(0, min(100, c))
+    price_ok = _price_int_from_offer(o) is not None
+    link_ok = bool(o.get("link"))
+    dep = o.get("dep_time")
+    arr = o.get("arr_time")
+    times_ok = VU.is_time_hhmm(dep) and VU.is_time_hhmm(arr)
+    duration = o.get("duration_min")
+    duration_ok = isinstance(duration, int) and duration > 0
+
+    if price_ok and link_ok and times_ok and duration_ok:
+        return 90
+    if price_ok and link_ok and (times_ok or duration_ok):
+        return 70
+    if price_ok and (link_ok or times_ok or duration_ok):
+        return 50
+    return 30
 
 
-def compute_rank_score(o: dict) -> float:
+RANK_WEIGHTS = {
+    "price": 1.0,
+    "duration": 0.5,
+    "stops": 180.0,
+    "next_day_penalty": 120.0,
+    "below_avg_bonus": 300.0,
+}
+
+
+def compute_rank_score(o: dict, *, avg_price: Optional[float] = None) -> float:
     price = _price_int_from_offer(o)
     dur = o.get("duration_min") or 9999
     stops = o.get("stops") or 0
     extra = int(o.get("extra_offers") or o.get("extra_offers_count") or 0)
     conf = o.get("confidence", compute_confidence(o))
+    next_day = 1 if o.get("next_day") else 0
+
+    below_avg = 0.0
+    if price is not None and avg_price:
+        try:
+            below_avg = max(0.0, (avg_price - price) / avg_price)
+        except Exception:
+            below_avg = 0.0
+
     if price is not None:
-        return float(price) + 0.5 * float(dur) + 180.0 * float(stops) - 2.0 * min(extra, 10)
-    return 1_000_000.0 - conf * 100.0 - float(dur)
+        return (
+            RANK_WEIGHTS["price"] * float(price)
+            + RANK_WEIGHTS["duration"] * float(dur)
+            + RANK_WEIGHTS["stops"] * float(stops)
+            + RANK_WEIGHTS["next_day_penalty"] * float(next_day)
+            - RANK_WEIGHTS["below_avg_bonus"] * float(below_avg)
+            - 2.0 * min(extra, 10)
+        )
+    return 1_000_000.0 - conf * 100.0 - float(dur) + RANK_WEIGHTS["next_day_penalty"] * float(next_day)
 
 
-def dedupe_and_rank(offers: list[dict]) -> list[dict]:
+def dedupe_and_rank(offers: list[dict], *, avg_price: Optional[float] = None) -> list[dict]:
     bucket: dict[str, dict] = {}
     for o in offers:
         o = dict(o)
@@ -142,14 +169,24 @@ def dedupe_and_rank(offers: list[dict]) -> list[dict]:
             bucket[key] = merge_offer(bucket[key], o)
             bucket[key]["confidence"] = compute_confidence(bucket[key])
     deduped = list(bucket.values())
-    deduped.sort(key=compute_rank_score)
+    deduped.sort(key=lambda o: compute_rank_score(o, avg_price=avg_price))
     return deduped
 
 def evaluate_offer_batch(*, flights, min_price, ceiling, origin, dest, depart_date, queue, state_store):
     logger = logging.getLogger("kiwi_bot")
     if not flights:
         return DecisionResult(False, "NO_FLIGHTS", None, 0, None)
-    ranked = dedupe_and_rank(flights)
+    route_key = f"{origin}-{dest}"
+    trip_type = "RT_USA" if "EUA" in dest or "USA" in dest or "NYC" in dest else "OW"
+    avg_price = None
+    try:
+        stats = state_store.get_stats(route_key, trip_type)
+        if stats and stats.get("n", 0) >= 10 and stats.get("avg"):
+            avg_price = stats.get("avg")
+    except Exception:
+        avg_price = None
+
+    ranked = dedupe_and_rank(flights, avg_price=avg_price)
     if not ranked:
         return DecisionResult(False, "NO_FLIGHTS", None, 0, None)
     min_price_local = _price_int_from_offer(ranked[0])
@@ -163,8 +200,6 @@ def evaluate_offer_batch(*, flights, min_price, ceiling, origin, dest, depart_da
     # ID forte
     offer = dict(best[0])
     offer["depart_date"] = depart_date
-    route_key = f"{origin}-{dest}"
-    trip_type = "RT_USA" if "EUA" in dest or "USA" in dest or "NYC" in dest else "OW"
     score, meta = compute_priority_score(
         price=min_price_local,
         ceiling=ceiling,

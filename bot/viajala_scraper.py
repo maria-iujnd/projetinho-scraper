@@ -15,6 +15,8 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 
 from bot.viajala_urls import build_viajala_url_ow_with_fallback
+from bot import selectors_viajala as SEL
+from bot import utils_viajala as VU
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +24,7 @@ _COOKIES_ACCEPTED = False
 _INTERSTITIAL_SEEN = 0
 _INTERSTITIAL_DISMISSED = 0
 _INTERSTITIAL_WAITED = 0
+_DEBUG_CARD_EXTRACTION = os.getenv("VIAJALA_DEBUG_CARD", "0").strip() == "1"
 
 
 
@@ -58,7 +61,7 @@ def _save_adapt_state(debug_dir: str, data: dict) -> None:
 
 def _detect_page_state(driver) -> str:
     text = (driver.page_source or "").lower()
-    if driver.find_elements(By.CSS_SELECTOR, "div.segments.result-item-ow"):
+    if driver.find_elements(By.CSS_SELECTOR, SEL.CSS_CARD_RESULT_OW):
         return "RESULTS_OK"
     if "aceitar" in text and "cookies" in text:
         return "CONSENT"
@@ -79,12 +82,12 @@ def _dismiss_overlays(driver, timeout: int = 6) -> None:
         pass
 
     possible_buttons = [
-        (By.XPATH, "//button[contains(., 'Aceitar')]") ,
-        (By.XPATH, "//button[contains(., 'Concordo')]") ,
-        (By.XPATH, "//button[contains(., 'Entendi')]") ,
-        (By.XPATH, "//button[contains(., 'Fechar')]") ,
-        (By.XPATH, "//button[contains(., 'Continuar')]") ,
-        (By.CSS_SELECTOR, "[aria-label*='close' i], [aria-label*='fechar' i]"),
+        (By.XPATH, SEL.XPATH_BTN_ACEITAR),
+        (By.XPATH, SEL.XPATH_BTN_CONCORDO),
+        (By.XPATH, SEL.XPATH_BTN_ENTENDI),
+        (By.XPATH, SEL.XPATH_BTN_FECHAR),
+        (By.XPATH, SEL.XPATH_BTN_CONTINUAR),
+        (By.CSS_SELECTOR, SEL.CSS_ARIA_CLOSE_GENERIC),
     ]
 
     for by, sel in possible_buttons:
@@ -96,7 +99,7 @@ def _dismiss_overlays(driver, timeout: int = 6) -> None:
             pass
 
     try:
-        driver.execute_script(
+    modal_css = SEL.CSS_MODAL_MAT
             """
             document.documentElement.classList.remove('cdk-global-scrollblock');
             document.body.classList.remove('cdk-global-scrollblock');
@@ -112,13 +115,8 @@ def _dismiss_overlays(driver, timeout: int = 6) -> None:
 
 def _try_accept_cookies(driver, timeout: int = 8) -> bool:
     end = time.time() + timeout
-    link_xpath = (
-        "//a[normalize-space()='Aceitar' or "
-        "contains(translate(normalize-space(.), 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'ACEITAR')]"
-    )
-    button_xpath = (
-        "//button[contains(translate(normalize-space(.), 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'ACEITAR')]"
-    )
+    link_xpath = SEL.XPATH_COOKIE_ACCEPT_LINK
+    button_xpath = SEL.XPATH_COOKIE_ACCEPT_BUTTON
     try:
         while time.time() < end:
             try:
@@ -157,40 +155,6 @@ def _try_accept_cookies(driver, timeout: int = 8) -> bool:
     return False
 
 
-def _normalize_airline(name: str | None) -> str | None:
-    if not name:
-        return None
-    value = name.strip().upper()
-    if not value:
-        return None
-    mapping = {
-        "G3": "GOL",
-        "GOL": "GOL",
-        "AZUL": "AZUL",
-        "AD": "AZUL",
-        "LATAM": "LATAM",
-        "LA": "LATAM",
-        "JJ": "LATAM",
-        "TAM": "LATAM",
-    }
-    return mapping.get(value, value)
-
-
-def _is_time_hhmm(s: str | None) -> bool:
-    if not s:
-        return False
-    s = s.strip()
-    if not re.match(r"^\d{2}:\d{2}$", s):
-        return False
-    try:
-        hh, mm = s.split(":", 1)
-        h = int(hh)
-        m = int(mm)
-    except Exception:
-        return False
-    return 0 <= h <= 23 and 0 <= m <= 59
-
-
 def _wait_results_stable(driver, cards_css: str, timeout: int = 35, stable_rounds: int = 3, poll: float = 0.6) -> bool:
     end = time.time() + timeout
     last_count = None
@@ -215,7 +179,7 @@ def _wait_results_stable(driver, cards_css: str, timeout: int = 35, stable_round
 def _wait_cards_loaded(driver, timeout: int = 20) -> bool:
     try:
         WebDriverWait(driver, timeout).until(
-            lambda d: len(d.find_elements(By.CSS_SELECTOR, "span.price-value")) > 0
+            lambda d: len(d.find_elements(By.CSS_SELECTOR, SEL.CSS_PRICE_VALUE)) > 0
         )
         return True
     except Exception:
@@ -224,15 +188,10 @@ def _wait_cards_loaded(driver, timeout: int = 20) -> bool:
 
 def _try_close_overlay(driver, timeout: int = 4) -> bool:
     end = time.time() + timeout
-    selectors = [
-        "//button[contains(translate(normalize-space(.), 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'FECHAR')]",
-        "//button[contains(translate(normalize-space(.), 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'ENTENDI')]",
-        "//button[contains(translate(normalize-space(.), 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'OK')]",
-        "//button[contains(translate(normalize-space(.), 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'CONTINUAR')]",
-    ]
+    selectors = list(SEL.XPATH_OVERLAY_CLOSE_SELECTORS)
     aria_selectors = [
-        "[aria-label*='close' i]",
-        "[aria-label*='fechar' i]",
+        SEL.CSS_ARIA_CLOSE_BUTTON,
+        SEL.CSS_ARIA_FECHAR_BUTTON,
     ]
     try:
         while time.time() < end:
@@ -296,7 +255,7 @@ def _dismiss_interstitials(driver, timeout: int = 8) -> bool:
     end = time.time() + timeout
     detected = False
 
-    dialogs = driver.find_elements(By.CSS_SELECTOR, "[role='dialog']")
+    dialogs = driver.find_elements(By.CSS_SELECTOR, SEL.CSS_DIALOG_ROLE)
     if dialogs:
         detected = True
 
@@ -310,7 +269,7 @@ def _dismiss_interstitials(driver, timeout: int = 8) -> bool:
     if detected and _INTERSTITIAL_SEEN > 2:
         try:
             WebDriverWait(driver, timeout).until(
-                lambda d: not d.find_elements(By.CSS_SELECTOR, "[role='dialog']")
+                lambda d: not d.find_elements(By.CSS_SELECTOR, SEL.CSS_DIALOG_ROLE)
             )
             _INTERSTITIAL_WAITED += 1
         except Exception:
@@ -319,8 +278,8 @@ def _dismiss_interstitials(driver, timeout: int = 8) -> bool:
 
     if detected:
         selectors = [
-            "button[aria-label*='close' i]",
-            "button[aria-label*='fechar' i]",
+            SEL.CSS_ARIA_CLOSE_BUTTON,
+            SEL.CSS_ARIA_FECHAR_BUTTON,
         ]
         for sel in selectors:
             try:
@@ -332,7 +291,7 @@ def _dismiss_interstitials(driver, timeout: int = 8) -> bool:
             except Exception:
                 continue
         try:
-            btn = driver.find_element(By.XPATH, "//button[contains(., '×') or contains(., 'X')]")
+            btn = driver.find_element(By.XPATH, SEL.XPATH_INTERSTITIAL_CLOSE)
             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
             btn.click()
             _INTERSTITIAL_DISMISSED += 1
@@ -349,7 +308,7 @@ def _dismiss_interstitials(driver, timeout: int = 8) -> bool:
 
         try:
             WebDriverWait(driver, timeout).until(
-                lambda d: not d.find_elements(By.CSS_SELECTOR, "[role='dialog']")
+                lambda d: not d.find_elements(By.CSS_SELECTOR, SEL.CSS_DIALOG_ROLE)
             )
             _INTERSTITIAL_WAITED += 1
         except Exception:
@@ -359,9 +318,9 @@ def _dismiss_interstitials(driver, timeout: int = 8) -> bool:
 
 
 def _dismiss_partner_modal(driver, timeout: int = 10) -> bool:
-    modal_sel = "div.frame-container.modal"
-    close_sel = "app-svg-icon.smart-close"
-    header_sel = "div.frame-container.modal div.header"
+    modal_sel = SEL.CSS_PARTNER_MODAL
+    close_sel = SEL.CSS_PARTNER_MODAL_CLOSE
+    header_sel = SEL.CSS_PARTNER_MODAL_HEADER
     start = time.time()
 
     def _modal_present() -> bool:
@@ -390,7 +349,7 @@ def _dismiss_partner_modal(driver, timeout: int = 10) -> bool:
             pass
         try:
             el = driver.find_element(By.CSS_SELECTOR, close_sel)
-            svg = el.find_element(By.CSS_SELECTOR, "svg")
+            svg = el.find_element(By.CSS_SELECTOR, SEL.CSS_SVG)
             svg.click()
             logger.info("[VIAJALA] partner_modal=dismissed method=close_svg")
             return True
@@ -430,9 +389,9 @@ def _wait_interstitial_to_clear(driver, timeout: int = 15) -> None:
 
 def _close_viajala_interstitial(driver, timeout: int = 2) -> bool:
     selectors = [
-        "app-svg-icon.smart-close[name='close']",
-        "app-svg-icon.smart-close",
-        "app-svg-icon.smart-close .mat-icon",
+        SEL.CSS_PARTNER_MODAL_CLOSE_ICON,
+        SEL.CSS_PARTNER_MODAL_CLOSE,
+        SEL.CSS_PARTNER_MODAL_CLOSE_MAT_ICON,
     ]
     for css in selectors:
         try:
@@ -446,40 +405,10 @@ def _close_viajala_interstitial(driver, timeout: int = 2) -> bool:
 
 def _partner_modal_visible(driver) -> bool:
     try:
-        modals = driver.find_elements(By.CSS_SELECTOR, "div.frame-container.modal")
+        modals = driver.find_elements(By.CSS_SELECTOR, SEL.CSS_PARTNER_MODAL)
         return bool(modals) and modals[0].is_displayed()
     except Exception:
         return False
-
-
-def _parse_price_value(text: str) -> int | None:
-    if not text:
-        return None
-    cleaned = (
-        text.replace("R$", "")
-        .replace(".", "")
-        .replace(" ", "")
-        .replace("\xa0", "")
-        .strip()
-    )
-    if "," in cleaned:
-        cleaned = cleaned.split(",", 1)[0]
-    return int(cleaned) if cleaned.isdigit() else None
-
-
-def _parse_duration_min(text: str) -> int | None:
-    if not text:
-        return None
-    match = re.search(r"(\d{1,2})h(\d{2})", text)
-    if match:
-        return int(match.group(1)) * 60 + int(match.group(2))
-    match = re.search(r"(\d{1,2})h(\d{1,2})", text)
-    if match:
-        return int(match.group(1)) * 60 + int(match.group(2))
-    match = re.search(r"(\d{1,2})h", text)
-    if match:
-        return int(match.group(1)) * 60
-    return None
 
 
 def _parse_extra_offers_count(text: str) -> int | None:
@@ -492,6 +421,20 @@ def _parse_extra_offers_count(text: str) -> int | None:
 def _find_price_text(card) -> str | None:
     patterns = [r"R\$\s*[\d\.]+,\d{2}", r"R\$\s*[\d\.,]+"]
     candidates = []
+
+    attr_selectors = SEL.CSS_PRICE_ATTR_SELECTORS
+    attr_names = SEL.CSS_PRICE_ATTR_NAMES
+    try:
+        attr_elements = [card]
+        for sel in attr_selectors:
+            attr_elements.extend(card.find_elements(By.CSS_SELECTOR, sel))
+        for el in attr_elements:
+            for attr in attr_names:
+                value = el.get_attribute(attr)
+                if value:
+                    candidates.append(value)
+    except Exception:
+        pass
 
     sources = [
         card.text or "",
@@ -507,7 +450,7 @@ def _find_price_text(card) -> str | None:
     if not candidates:
         return None
 
-    prices = [p for p in (_parse_price_value(c) for c in candidates) if p is not None]
+    prices = [p for p in (VU.parse_price_int(c) for c in candidates) if p is not None]
     if not prices:
         return None
     return f"R$ {min(prices)}"
@@ -522,47 +465,176 @@ def _wait_any_price(driver, timeout: int = 12) -> bool:
         return False
 
 
+def extract_main_offer(card) -> dict:
+    debug: dict[str, Any] = {
+        "price_primary_text": None,
+        "price_candidates": [],
+        "price_candidates_debug": [],
+        "price_source": None,
+        "wait_price_ok": False,
+        "href": None,
+    }
+
+    try:
+        driver = card._parent
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", card)
+    except Exception:
+        driver = None
+
+    end = time.time() + 8
+    while time.time() < end:
+        try:
+            price_els = card.find_elements(By.CSS_SELECTOR, SEL.CSS_PRICE_VALUE)
+            price_texts = [(e.text or "").strip() for e in price_els]
+            ok = any(t and "ver preço" not in t.lower() and re.search(r"\d", t) for t in price_texts)
+            if ok:
+                debug["wait_price_ok"] = True
+                break
+        except Exception:
+            pass
+        time.sleep(0.25)
+
+    candidates: list[int] = []
+    candidates_debug: list[dict[str, Any]] = []
+
+    try:
+        primary_el = card.find_element(By.CSS_SELECTOR, SEL.CSS_PRICE_VALUE_PRIMARY)
+        primary_text = (primary_el.text or "").strip()
+        debug["price_primary_text"] = primary_text
+        primary_value, primary_reason = _evaluate_price_candidate(primary_text)
+        candidates_debug.append({"text": primary_text, "value": primary_value, "rule": primary_reason or "ok"})
+        if primary_value is not None:
+            candidates.append(primary_value)
+            debug["price_source"] = "primary"
+    except Exception:
+        pass
+
+    try:
+        for el in card.find_elements(By.CSS_SELECTOR, SEL.CSS_PRICE_CANDIDATES):
+            text = (el.text or "").strip()
+            value, reason = _evaluate_price_candidate(text)
+            candidates_debug.append({"text": text, "value": value, "rule": reason or "ok"})
+            if value is not None:
+                candidates.append(value)
+    except Exception:
+        pass
+
+    text_price = _find_price_text(card) or ""
+    value, reason = _evaluate_price_candidate(text_price)
+    if text_price:
+        candidates_debug.append({"text": text_price, "value": value, "rule": reason or "ok"})
+    if value is not None:
+        candidates.append(value)
+
+    filtered = [v for v in candidates if 0 < v < 200000]
+    debug["price_candidates"] = sorted(set(filtered))
+    debug["price_candidates_debug"] = candidates_debug
+
+    price_int: int | None = None
+    if filtered:
+        if debug.get("price_source") == "primary" and debug.get("price_primary_text"):
+            price_int = VU.parse_price_int(debug["price_primary_text"])
+        if price_int is None:
+            price_int = min(filtered)
+            debug["price_source"] = "min_candidate"
+
+    href = None
+    try:
+        link_el = card.find_element(By.CSS_SELECTOR, SEL.CSS_LINK_BOOK_REDIRECT)
+        href = link_el.get_attribute("href")
+    except Exception:
+        href = None
+    debug["href"] = href
+
+    if (price_int is None or not href) and _DEBUG_CARD_EXTRACTION:
+        _debug_card_failure(card, _ensure_debug_dir(), "price_or_href_missing", candidates_debug)
+
+    confidence = 0
+    confidence += 40 if price_int is not None else 0
+    confidence += 30 if href else 0
+    confidence += 20 if debug.get("price_source") == "primary" else 0
+    confidence += 10 if debug.get("wait_price_ok") else 0
+    confidence = min(100, confidence)
+
+    return {
+        "price_int": price_int,
+        "href": href,
+        "confidence": confidence,
+        "debug": debug,
+    }
+
+
 def _find_airline(card) -> str | None:
     try:
-        label = card.find_element(By.CSS_SELECTOR, "div.partner-label > div").text.strip()
+        label = card.find_element(By.CSS_SELECTOR, SEL.CSS_PARTNER_LABEL).text.strip()
     except Exception:
         label = ""
     if label:
         return label
     try:
-        alt = card.find_element(By.CSS_SELECTOR, "div.airline-logo img").get_attribute("alt")
+        alt = card.find_element(By.CSS_SELECTOR, SEL.CSS_AIRLINE_LOGO_IMG).get_attribute("alt")
         return alt.strip() if alt else None
     except Exception:
         return None
 
 
-    def _normalize_airline(name: str | None) -> str | None:
-        if not name:
-            return None
-        code = name.strip().upper()
-        mapping = {"G3": "GOL", "JJ": "LATAM", "AD": "Azul"}
-        return mapping.get(code, name)
+def _evaluate_price_candidate(text: str) -> tuple[int | None, str | None]:
+    if not text:
+        return None, "empty"
+    raw = text.strip()
+    t = " ".join(raw.lower().split())
+
+    if "ver preço" in t or "ver preco" in t:
+        return None, "placeholder"
+    if not ("r$" in t or "brl" in t):
+        return None, "currency_missing"
+    if any(m in t for m in ["a partir de", "desde", "promo", "oferta", "desconto"]):
+        return None, "promo_text"
+    if any(m in t for m in [" x ", "x ", "vez", "parcel", "sem juros"]):
+        return None, "installment"
+
+    value = VU.parse_price_int(raw)
+    if value is None:
+        return None, "parse_failed"
+    if value <= 0 or value > 200000:
+        return None, "out_of_range"
+    return value, None
 
 
-    def _is_time_hhmm(value: str | None) -> bool:
-        if not value:
-            return False
-        return bool(re.match(r"^\d{2}:\d{2}$", value.strip()))
-
-
-    def _compute_confidence(price_ok: bool, times_ok: bool, duration_ok: bool, airline_ok: bool, link_ok: bool) -> int:
-        score = 0
-        score += 30 if price_ok else 0
-        score += 20 if times_ok else 0
-        score += 20 if duration_ok else 0
-        score += 20 if airline_ok else 0
-        score += 10 if link_ok else 0
-        return score
+def _debug_card_failure(card, debug_dir: str, failure_reason: str, candidates_debug: list[dict]) -> None:
+    if not _DEBUG_CARD_EXTRACTION:
+        return
+    ts = int(time.time() * 1000)
+    try:
+        card_id = card.get_attribute("id") or "card"
+    except Exception:
+        card_id = "card"
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]+", "_", card_id)
+    html_path = os.path.join(debug_dir, f"viajala_card_{safe_id}_{ts}.html")
+    meta_path = os.path.join(debug_dir, f"viajala_card_{safe_id}_{ts}.json")
+    try:
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(card.get_attribute("outerHTML") or "")
+    except Exception:
+        pass
+    try:
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "failure_reason": failure_reason,
+                    "candidates": candidates_debug,
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+    except Exception:
+        pass
 
 
 def _parse_stops(card) -> int | None:
     try:
-        layovers = card.find_element(By.CSS_SELECTOR, "div.layovers").text.strip()
+        layovers = card.find_element(By.CSS_SELECTOR, SEL.CSS_LAYOVERS).text.strip()
         return 0 if layovers == "" else None
     except Exception:
         return None
@@ -571,7 +643,7 @@ def _parse_stops(card) -> int | None:
 def _card_has_valid_route(card, origin: str, destination: str) -> bool:
     airports = []
     try:
-        for el in card.find_elements(By.CSS_SELECTOR, "div.airport"):
+        for el in card.find_elements(By.CSS_SELECTOR, SEL.CSS_AIRPORT):
             text = (el.text or "").strip().upper()
             if text:
                 airports.append(text)
@@ -589,11 +661,11 @@ def _card_has_valid_route(card, origin: str, destination: str) -> bool:
 
 def _is_next_day(dep_time: str | None, arr_time: str | None, card) -> bool:
     try:
-        if card.find_elements(By.CSS_SELECTOR, "div.nextday"):
+        if card.find_elements(By.CSS_SELECTOR, SEL.CSS_NEXTDAY):
             return True
     except Exception:
         pass
-    if _is_time_hhmm(dep_time) and _is_time_hhmm(arr_time):
+    if VU.is_time_hhmm(dep_time) and VU.is_time_hhmm(arr_time):
         dep_h, dep_m = [int(x) for x in dep_time.split(":")]
         arr_h, arr_m = [int(x) for x in arr_time.split(":")]
         if (arr_h, arr_m) < (dep_h, dep_m):
@@ -685,11 +757,11 @@ def scrape_with_selenium(
 
         try:
             WebDriverWait(driver, 25).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "div.segments.result-item-ow"))
+                EC.presence_of_element_located((By.CSS_SELECTOR, SEL.CSS_CARD_RESULT_OW))
             )
-            selector = "div.segments.result-item-ow"
+            selector = SEL.CSS_CARD_RESULT_OW
         except TimeoutException:
-            selector = "div.segments.result-item"
+            selector = SEL.CSS_CARD_RESULT_ITEM
 
         if _dismiss_partner_modal(driver):
             time.sleep(2)
@@ -705,10 +777,10 @@ def scrape_with_selenium(
             _save_adapt_state(debug_dir, adapt)
         cards = driver.find_elements(By.CSS_SELECTOR, selector)
         if not cards:
-            selector = "div.segments"
+            selector = SEL.CSS_CARD_SEGMENTS
             cards = [
                 c for c in driver.find_elements(By.CSS_SELECTOR, selector)
-                if c.find_elements(By.CSS_SELECTOR, "span.price-value") and c.find_elements(By.CSS_SELECTOR, "a.btn.book")
+                if c.find_elements(By.CSS_SELECTOR, SEL.CSS_PRICE_VALUE) and c.find_elements(By.CSS_SELECTOR, SEL.CSS_LINK_BOOK)
             ]
 
         last_selector = selector
@@ -733,7 +805,7 @@ def scrape_with_selenium(
         seen_links = set()
         for card in cards[:max_cards]:
             try:
-                if card.find_elements(By.XPATH, "ancestor::div[contains(@class,'frame-container') and contains(@class,'modal')]"):
+                if card.find_elements(By.XPATH, SEL.XPATH_CARD_IN_MODAL):
                     continue
             except Exception:
                 pass
@@ -744,52 +816,43 @@ def scrape_with_selenium(
             if not _card_has_valid_route(card, origin, destination):
                 continue
 
-            try:
-                price_text = card.find_element(By.CSS_SELECTOR, "span.price-value").text
-            except Exception:
-                price_text = ""
-            if not price_text:
-                price_text = _find_price_text(card) or ""
-            price = _parse_price_value(price_text)
+            extracted = extract_main_offer(card)
+            price = extracted.get("price_int")
+            link = extracted.get("href")
+            extract_confidence = extracted.get("confidence") or 0
+            extract_debug = extracted.get("debug")
             if price is not None and first_price_ts is None:
                 first_price_ts = time.time()
 
             try:
-                dep_time = card.find_element(By.CSS_SELECTOR, "div.departure strong").text.strip()
+                dep_time = card.find_element(By.CSS_SELECTOR, SEL.CSS_DEPARTURE_TIME).text.strip()
             except Exception:
                 dep_time = None
             try:
-                arr_time = card.find_element(By.CSS_SELECTOR, "div.arrival strong").text.strip()
+                arr_time = card.find_element(By.CSS_SELECTOR, SEL.CSS_ARRIVAL_TIME).text.strip()
             except Exception:
                 arr_time = None
             try:
-                duration_text = card.find_element(By.CSS_SELECTOR, "span.duration").text.strip()
+                duration_text = card.find_element(By.CSS_SELECTOR, SEL.CSS_DURATION).text.strip()
             except Exception:
                 duration_text = None
-            duration_min = _parse_duration_min(duration_text or "")
+            duration_min = VU.parse_duration_min(duration_text or "")
             if duration_min is not None and duration_min > 900:
                 duration_min = None
 
-            airline = _normalize_airline(_find_airline(card))
+            airline = VU.normalize_airline(_find_airline(card))
             stops = _parse_stops(card)
-
-            link = None
-            try:
-                link_el = card.find_element(By.CSS_SELECTOR, "a.btn.book")
-                href = link_el.get_attribute("href")
-                if href and "viajala.com.br/redirect" in href:
-                    link = href
-            except Exception:
-                link = None
 
             next_day = _is_next_day(dep_time, arr_time, card)
 
             price_ok = price is not None
-            times_ok = _is_time_hhmm(dep_time) and _is_time_hhmm(arr_time)
+            times_ok = VU.is_time_hhmm(dep_time) and VU.is_time_hhmm(arr_time)
             duration_ok = duration_min is not None
             airline_ok = bool(airline)
             link_ok = bool(link)
             confidence = _compute_confidence(price_ok, times_ok, duration_ok, airline_ok, link_ok)
+            if extract_confidence >= 60:
+                confidence = min(100, confidence + 5)
 
             if confidence < 60:
                 continue
@@ -814,6 +877,7 @@ def scrape_with_selenium(
                 "raw_text": text,
                 "confidence": confidence,
                 "extra_offers_count": _parse_extra_offers_count(text),
+                "extract_debug": extract_debug,
             }
             if next_day:
                 offer["next_day"] = True

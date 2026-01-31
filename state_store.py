@@ -366,6 +366,104 @@ def run_log_finish(run_id: int, status: str, checked_items: int, queued: int, se
         )
         conn.commit()
 
+
+def _ensure_route_daily_table(conn: sqlite3.Connection) -> None:
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS route_daily_stats (
+            route_key TEXT NOT NULL,
+            day TEXT NOT NULL,               -- YYYY-MM-DD
+            send_count INTEGER DEFAULT 0,
+            best_price INTEGER,
+            last_sent_at TEXT,
+            PRIMARY KEY(route_key, day)
+        )
+    """)
+    conn.commit()
+
+
+def get_route_daily_stats(route_key: str, day: Optional[str] = None, db_path: Optional[str] = None) -> dict:
+    day = day or datetime.date.today().isoformat()
+    with _connect(db_path) as conn:
+        _ensure_route_daily_table(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT send_count, best_price, last_sent_at FROM route_daily_stats WHERE route_key=? AND day=?",
+            (route_key, day),
+        )
+        row = cur.fetchone()
+    if not row:
+        return {"send_count": 0, "best_price": None, "last_sent_at": None, "day": day}
+    return {"send_count": row[0], "best_price": row[1], "last_sent_at": row[2], "day": day}
+
+
+def can_send_route_daily(
+    route_key: str,
+    daily_limit: int,
+    *,
+    price: Optional[int] = None,
+    record_break_pct: float = 0.10,
+    day: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> tuple[bool, str, dict]:
+    """Limite diário por rota com exceção de recorde do dia.
+
+    - Bloqueia se já atingiu daily_limit
+    - Permite se o preço atual bate recorde do dia (>= record_break_pct abaixo do melhor)
+    """
+    if daily_limit <= 0:
+        return True, "NO_LIMIT", {}
+    stats = get_route_daily_stats(route_key, day=day, db_path=db_path)
+    if stats["send_count"] < daily_limit:
+        return True, "UNDER_LIMIT", stats
+    best_price = stats.get("best_price")
+    if price is not None and best_price:
+        try:
+            if price <= best_price * (1.0 - record_break_pct):
+                return True, "RECORD_BREAK", stats
+        except Exception:
+            pass
+    return False, "DAILY_LIMIT", stats
+
+
+def record_route_send(
+    route_key: str,
+    *,
+    price: Optional[int] = None,
+    ts: Optional[str] = None,
+    day: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> dict:
+    """Registra envio por rota/dia e atualiza melhor preço do dia."""
+    day = day or datetime.date.today().isoformat()
+    ts = ts or _now_iso()
+    with _connect(db_path) as conn:
+        _ensure_route_daily_table(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT send_count, best_price FROM route_daily_stats WHERE route_key=? AND day=?",
+            (route_key, day),
+        )
+        row = cur.fetchone()
+        if not row:
+            send_count = 1
+            best_price = price
+            cur.execute(
+                "INSERT INTO route_daily_stats (route_key, day, send_count, best_price, last_sent_at) VALUES (?, ?, ?, ?, ?)",
+                (route_key, day, send_count, best_price, ts),
+            )
+        else:
+            send_count, best_price = row
+            send_count = int(send_count or 0) + 1
+            if price is not None and (best_price is None or price < best_price):
+                best_price = price
+            cur.execute(
+                "UPDATE route_daily_stats SET send_count=?, best_price=?, last_sent_at=? WHERE route_key=? AND day=?",
+                (send_count, best_price, ts, route_key, day),
+            )
+        conn.commit()
+    return {"send_count": send_count, "best_price": best_price, "last_sent_at": ts, "day": day}
+
 def make_offer_hash(
     trip_type: str,
     origin: str,

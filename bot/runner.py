@@ -6,7 +6,7 @@ from typing import Dict, Any, Tuple, List
 from selenium.common.exceptions import NoSuchWindowException, WebDriverException
 from bot.browser import open_browser, close_browser
 from bot.decision_engine import evaluate_offer_batch
-from bot.dedupe import make_offer_fingerprint, make_dedupe_key
+from bot.dedupe import make_offer_id, make_dedupe_key
 from bot.logging_setup import setup_logger
 from bot.planner import plan_attempts
 from bot.pricing_utils import brl
@@ -251,8 +251,9 @@ def run(args) -> int:
 
             deduped: List[Dict[str, Any]] = []
             for offer in normalized:
-                fingerprint = make_offer_fingerprint(offer)
-                dedupe_key = make_dedupe_key(fingerprint, channel="WHATSAPP", kind="ALERT")
+                offer_id = make_offer_id(offer)
+                dedupe_key = make_dedupe_key(offer_id, channel="WHATSAPP", kind="ALERT")
+                offer["offer_id"] = offer_id
                 offer["dedupe_key"] = dedupe_key
                 if is_in_queue(queue, dedupe_key):
                     logger.debug("[DEDUPE] queue duplicate key=%s", dedupe_key)
@@ -315,7 +316,14 @@ def run(args) -> int:
                     result.message_text,
                     result.dedupe_key,
                     result.priority,
-                    meta={"origin": origin, "dest": dest, "provider": provider, "date": date},
+                    meta={
+                        "origin": origin,
+                        "dest": dest,
+                        "provider": provider,
+                        "date": date,
+                        "min_price": min_price,
+                        "route": f"{origin}-{dest}",
+                    },
                 )
                 logger.info(
                     f"[ENQUEUE] dedupe_key={result.dedupe_key} priority={result.priority} queue_size={len(queue)}"

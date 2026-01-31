@@ -9,8 +9,13 @@ def make_offer_fingerprint(offer: Dict) -> str:
     """
     Build a stable fingerprint for dedupe, including provider.
 
-    Key order:
-      provider|origin|destination|depart_date|dep_time|arr_time|airline|duration_min|price|link
+    Key order (stable itinerary core):
+        provider|origin|destination|depart_date|dep_time|arr_time|airline|duration_min|stops|next_day
+
+    Normalization rules:
+        - provider/origin/destination/airline -> upper()
+        - missing fields -> empty string
+        - next_day -> "1" or "0"
     """
     provider = (offer.get("provider") or "").upper()
     origin = (offer.get("origin") or offer.get("origin_code") or "").upper()
@@ -20,11 +25,9 @@ def make_offer_fingerprint(offer: Dict) -> str:
     arr_time = offer.get("arr_time") or ""
     airline = (offer.get("airline") or "").upper()
     duration_min = offer.get("duration_min") or ""
-    price = offer.get("price")
-    if price is None:
-        price = offer.get("price_int")
-    price = price if price is not None else ""
-    link = offer.get("share_link") or offer.get("link") or ""
+    stops = offer.get("stops")
+    stops = stops if stops is not None else ""
+    next_day = "1" if offer.get("next_day") else "0"
 
     parts = [
         provider,
@@ -35,8 +38,8 @@ def make_offer_fingerprint(offer: Dict) -> str:
         str(arr_time or ""),
         airline,
         str(duration_min or ""),
-        str(price or ""),
-        str(link or ""),
+        str(stops or ""),
+        next_day,
     ]
     raw = "|".join(parts)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
@@ -44,7 +47,8 @@ def make_offer_fingerprint(offer: Dict) -> str:
 def make_offer_id(offer: Dict) -> str:
     """
     Gera um ID forte e estável para o voo/oferta.
-    Usa fingerprint estável (inclui provider e campos principais).
+    Usa fingerprint estável (inclui provider e campos principais)
+    e prefixa com "F_".
     """
     h = make_offer_fingerprint(offer)
     return f"F_{h}"
