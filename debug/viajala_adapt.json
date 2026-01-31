@@ -1,0 +1,25 @@
+{
+  "last_working_selector": "div.segments.result-item-ow",
+  "selector_success": {
+    "div.segments": 0,
+    "div.segments.result-item-ow": 4
+  },
+  "interstitial_seen_count": 1,
+  "interstitial_dismissed_count": 1,
+  "interstitial_waited_count": 0,
+  "last_run": {
+    "timestamp": 1769843153,
+    "url": "https://viajala.com.br/pesquisa-voos/REC-SAO/15-02-2026",
+    "page_state": "RESULTS_OK",
+    "cards_found": 21,
+    "offers_valid": 11,
+    "selector": "div.segments.result-item-ow",
+    "reason": null
+  },
+  "viajala_stats": {
+    "airport_url_failed": 1
+  },
+  "viajala_preferred_dest": {
+    "GRU": "SAO"
+  }
+}

@@ -1,0 +1,26 @@
+[
+  {
+    "origin": "REC",
+    "dest": "GRU",
+    "trip_type": "OW",
+    "depart_date": "2026-10-15",
+    "return_date": null,
+    "price": 399,
+    "link": "https://www.kiwi.com/br/search/results/recife/sao-paulo/2026-10-15_flex5/no-return/?aff=SUAREF",
+    "text": "✈️ REC → GRU\n📅 15/10/2026\n💰 R$ 399\n\nGol | Direto\n🔗 Link na oferta",
+    "priority": 0.85,
+    "group": null
+  },
+  {
+    "origin": "REC",
+    "dest": "SSA",
+    "trip_type": "RT",
+    "depart_date": "2026-11-20",
+    "return_date": "2026-11-27",
+    "price": 599,
+    "link": "https://www.kiwi.com/br/search/results/recife/salvador/2026-11-20/2026-11-27/?aff=SUAREF",
+    "text": "✈️ REC → SSA (IDA E VOLTA)\n📅 Ida: 20/11/2026 | Volta: 27/11/2026\n💰 R$ 599\n\nAzul | Direto\n📊 Melhor preço em 30 dias",
+    "priority": 0.90,
+    "group": "promos"
+  }
+]

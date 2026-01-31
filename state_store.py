@@ -1,0 +1,622 @@
+from typing import Optional, Tuple
+import threading
+import datetime
+import os
+import json
+import time
+import sqlite3  # <-- Adicione/mova esta linha para o topo
+# ====== ENVIOS POR GRUPO (JANELA/HORA) ======
+_send_lock = threading.Lock()
+import threading
+_send_lock = threading.Lock()
+import datetime
+def now_dt():
+    return datetime.datetime.now()
+
+def _get_send_state_path():
+    return os.path.join(os.path.dirname(__file__), 'send_timestamps.json')
+
+def _load_send_state():
+    path = _get_send_state_path()
+    if os.path.exists(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def _save_send_state(state):
+    path = _get_send_state_path()
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+def record_group_send(group, ts=None):
+    """Registra envio para o grupo (timestamp unix)."""
+    with _send_lock:
+        state = _load_send_state()
+        now = int(ts or time.time())
+        arr = state.get(group, [])
+        arr = [t for t in arr if now - t < 3600]  # mantém só últimos 60min
+        arr.append(now)
+        state[group] = arr
+        _save_send_state(state)
+
+def get_group_send_timestamps(group, window_seconds=3600):
+    """Retorna lista de timestamps unix dos últimos window_seconds para o grupo."""
+    state = _load_send_state()
+    now = int(time.time())
+    arr = state.get(group, [])
+    arr = [t for t in arr if now - t < window_seconds]
+    return arr
+
+def get_group_last_sent_ts(group):
+    """Retorna timestamp unix do último envio para o grupo, ou None."""
+    arr = get_group_send_timestamps(group, window_seconds=86400)
+    if arr:
+        return max(arr)
+    return None
+# ====== HISTÓRICO DE PREÇOS POR ROTA ======
+def record_sample(route_key: str, trip_type: str, price: int, ts: str = None, db_path: Optional[str] = None) -> None:
+    """Grava amostra de preço para rota/trip_type. Janela de 90 dias."""
+    import datetime
+    ts = ts or _now_iso()
+    with _connect(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS price_samples (
+                route_key TEXT,
+                trip_type TEXT,
+                price INTEGER,
+                ts TEXT
+            )
+        ''')
+        cur.execute('''
+            INSERT INTO price_samples (route_key, trip_type, price, ts) VALUES (?, ?, ?, ?)
+        ''', (route_key, trip_type, price, ts))
+        # Limpa amostras antigas (90 dias)
+        cutoff = (datetime.datetime.now() - datetime.timedelta(days=90)).isoformat(timespec="seconds")
+        cur.execute('''DELETE FROM price_samples WHERE ts < ?''', (cutoff,))
+        conn.commit()
+
+def get_stats(route_key: str, trip_type: str, db_path: Optional[str] = None) -> dict:
+    """Retorna stats {'avg':..., 'n':...} para rota/trip_type nos últimos 90 dias."""
+    import datetime
+    cutoff = (datetime.datetime.now() - datetime.timedelta(days=90)).isoformat(timespec="seconds")
+    with _connect(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute('''
+            SELECT AVG(price), COUNT(*) FROM price_samples
+            WHERE route_key=? AND trip_type=? AND ts >= ?
+        ''', (route_key, trip_type, cutoff))
+        row = cur.fetchone()
+    avg, n = row if row else (None, 0)
+    return {"avg": avg, "n": n}
+# ====== DEDUPE FORTE COM TTL ======
+def prune_history(older_than_days: int = 90, db_path: Optional[str] = None) -> int:
+    """Remove amostras de histórico de preços com mais de X dias."""
+    import datetime
+    cutoff = (datetime.datetime.now() - datetime.timedelta(days=older_than_days)).isoformat(timespec="seconds")
+    with _connect(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute('''DELETE FROM price_samples WHERE ts < ?''', (cutoff,))
+        deleted = cur.rowcount
+        conn.commit()
+    return deleted
+def _migrate_3_to_4(conn: sqlite3.Connection) -> None:
+    """Migração 3→4: adiciona tabela seen_dedupe para deduplicação forte com TTL."""
+    cur = conn.cursor()
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS seen_dedupe (
+            key TEXT PRIMARY KEY,
+            first_seen_ts INTEGER,
+            last_seen_ts INTEGER
+        )
+    ''')
+    cur.execute("DELETE FROM schema_meta")
+    cur.execute("INSERT INTO schema_meta (version) VALUES (4)")
+    conn.commit()
+
+def was_seen_recently(key: str, ttl_seconds: int = 86400, db_path: Optional[str] = None) -> bool:
+    """Retorna True se key foi vista nos últimos ttl_seconds."""
+    now = int(datetime.datetime.now().timestamp())
+    with _connect(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT last_seen_ts FROM seen_dedupe WHERE key=?", (key,))
+        row = cur.fetchone()
+    if not row:
+        return False
+    last_seen = row[0]
+    return (now - last_seen) < ttl_seconds
+
+def mark_seen(key: str, db_path: Optional[str] = None) -> None:
+    now = int(datetime.datetime.now().timestamp())
+    with _connect(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute('''
+            INSERT INTO seen_dedupe (key, first_seen_ts, last_seen_ts)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET last_seen_ts=excluded.last_seen_ts
+        ''', (key, now, now))
+        conn.commit()
+
+def prune_seen(older_than_seconds: int = 7*86400, db_path: Optional[str] = None) -> int:
+    """Remove entradas antigas de seen_dedupe."""
+    now = int(datetime.datetime.now().timestamp())
+    cutoff = now - older_than_seconds
+    with _connect(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM seen_dedupe WHERE last_seen_ts < ?", (cutoff,))
+        deleted = cur.rowcount
+        conn.commit()
+    return deleted
+# state_store.py
+"""
+Single source of truth for bot persistence with schema versioning.
+
+This module manages all persistence operations for the flight scraper bot:
+
+Database: kiwi_state.db (unified, single instance)
+Purpose: Ensures scraper and sender use the same state, avoiding dedupe inconsistencies.
+
+Note: db.py (scraper_data.db) is DEPRECATED and not used by the bot.
+All new code should use state_store module exclusively.
+"""
+import datetime
+from date_utils import format_date_for_user  # Regra: toda data exibida ao usuário DEVE passar por esta função
+
+# ATENÇÃO: NUNCA monte datas manualmente para o usuário!
+# Sempre use format_date_for_user(dt) para exibir datas em mensagens, logs ou relatórios para o usuário final.
+import hashlib
+import os
+import sqlite3
+from typing import Optional
+import settings
+
+# Default DB path (can be overridden by callers passing db_path)
+DB_PATH = settings.db_file(None)
+
+# bump schema for run_log table + link coupling
+SCHEMA_VERSION = 4
+
+def _get_db_path(path: Optional[str]) -> str:
+    return path if path is not None else DB_PATH
+
+def _connect(db_path: Optional[str] = None) -> sqlite3.Connection:
+    """
+    Cria conexão SQLite com WAL + timeout para evitar "database is locked".
+    
+    Configura:
+    - journal_mode=WAL: permite leituras concorrentes durante escritas
+    - busy_timeout: aguarda até 5 segundos se DB está travado
+    - synchronous=NORMAL: menos fsync (ainda seguro)
+    """
+    path = _get_db_path(db_path)
+    conn = sqlite3.connect(path, timeout=5.0)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+def _get_current_schema_version(conn: sqlite3.Connection) -> int:
+    """Lê versão atual do schema. Retorna 0 se tabela não existe."""
+    try:
+        cursor = conn.execute("SELECT version FROM schema_meta ORDER BY rowid DESC LIMIT 1")
+        row = cursor.fetchone()
+        return row[0] if row else 0
+    except Exception:
+        return 0
+
+def _migrate_0_to_1(conn: sqlite3.Connection) -> None:
+    """Migração 0→1: cria schema_meta e tabelas iniciais."""
+    cur = conn.cursor()
+    
+    # Cria tabela de metadados de schema
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS schema_meta (
+            version INTEGER NOT NULL
+        )
+    """)
+    
+    # Unified table for OW and RT (return_date NULL for OW)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS route_date_state (
+            origin TEXT NOT NULL,
+            dest   TEXT NOT NULL,
+            trip_type TEXT NOT NULL,             -- 'OW' ou 'RT'
+            depart_date TEXT NOT NULL,           -- YYYY-MM-DD
+            return_date TEXT,                    -- YYYY-MM-DD (NULL for OW)
+            status TEXT NOT NULL,                -- GOOD/BAD/NO_DATA
+            best_price INTEGER,
+            last_checked_at TEXT NOT NULL,       -- ISO
+            cooldown_until TEXT NOT NULL,        -- ISO
+            PRIMARY KEY(origin, dest, trip_type, depart_date, return_date)
+        )
+    """)
+
+    # RT price history (for avg)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS rt_price_history (
+            origin TEXT NOT NULL,
+            dest   TEXT NOT NULL,
+            depart_date TEXT NOT NULL,
+            return_date TEXT NOT NULL,
+            price REAL NOT NULL,
+            checked_at TEXT NOT NULL,
+            PRIMARY KEY(origin, dest, depart_date, return_date, checked_at)
+        )
+    """)
+
+    # Announcements dedupe
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS announcements (
+            offer_hash TEXT PRIMARY KEY,
+            trip_type TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    
+    # Marca versão no schema_meta
+    cur.execute("DELETE FROM schema_meta")
+    cur.execute("INSERT INTO schema_meta (version) VALUES (1)")
+    conn.commit()
+
+def _migrate_1_to_2(conn: sqlite3.Connection) -> None:
+    """Migração 1→2: adiciona tabela run_log para métricas por execução."""
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS run_log (
+            run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            component TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            status TEXT,
+            checked_items INTEGER DEFAULT 0,
+            queued INTEGER DEFAULT 0,
+            sent INTEGER DEFAULT 0,
+            errors TEXT
+        )
+    """)
+    # update schema version
+    cur.execute("DELETE FROM schema_meta")
+    cur.execute("INSERT INTO schema_meta (version) VALUES (2)")
+    conn.commit()
+
+def _migrate_2_to_3(conn: sqlite3.Connection) -> None:
+    """Migração 2→3: adiciona coluna `link` a announcements para acoplamento obrigatório.
+    
+    Modelo de link coupling: cada oferta anunciada deve ter seu link registrado.
+    Garante que não há perda de vínculo entre mensagem e link afiliado.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute("ALTER TABLE announcements ADD COLUMN link TEXT")
+    except sqlite3.OperationalError:
+        # Coluna já existe (se rerun)
+        pass
+    
+    # update schema version
+    cur.execute("DELETE FROM schema_meta")
+    cur.execute("INSERT INTO schema_meta (version) VALUES (3)")
+    conn.commit()
+
+def setup_database(db_path: Optional[str] = None) -> None:
+    """Setup com versionamento de schema e migrações automáticas."""
+    with _connect(db_path) as conn:
+        current_version = _get_current_schema_version(conn)
+        if current_version < 1:
+            _migrate_0_to_1(conn)
+            current_version = 1
+        if current_version < 2:
+            _migrate_1_to_2(conn)
+            current_version = 2
+        if current_version < 3:
+            _migrate_2_to_3(conn)
+            current_version = 3
+        if current_version < 4:
+            _migrate_3_to_4(conn)
+            current_version = 4
+
+def _now_iso() -> str:
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+def _iso_from_dt(dt: datetime.datetime) -> str:
+    return dt.isoformat(timespec="seconds")
+
+def _dt_from_iso(s: str) -> datetime.datetime:
+    return datetime.datetime.fromisoformat(s)
+
+
+def run_log_start(component: str, db_path: Optional[str] = None) -> int:
+    """Registra o início de uma execução e retorna run_id."""
+    with _connect(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO run_log (component, started_at, status) VALUES (?, ?, ?)",
+            (str(component), _now_iso(), "RUNNING")
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def run_log_finish(run_id: int, status: str, checked_items: int, queued: int, sent: int, errors: Optional[str] = None, db_path: Optional[str] = None) -> None:
+    """Atualiza o registro de execução com métricas finais.
+
+    `errors` é truncado para ~4KB para evitar gravar stack traces enormes.
+    """
+    if run_id is None:
+        return
+    if errors is not None:
+        try:
+            errors = str(errors)
+        except Exception:
+            errors = "(error converting errors)"
+        # Truncate to ~4096 chars
+        if len(errors) > 4096:
+            errors = errors[:4096]
+
+    with _connect(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE run_log SET finished_at=?, status=?, checked_items=?, queued=?, sent=?, errors=?
+            WHERE run_id=?
+            """,
+            (_now_iso(), str(status), int(checked_items), int(queued), int(sent), errors, int(run_id))
+        )
+        conn.commit()
+
+def make_offer_hash(
+    trip_type: str,
+    origin: str,
+    dest: str,
+    depart_date: str,
+    return_date: Optional[str],
+    min_price: int,
+    link: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> str:
+    """
+    Gera hash estável para deduplicação de ofertas com acoplamento de link.
+    
+    Formato da chave: provider|trip_type|origin|dest|depart_date|return_date|min_price|link
+    
+    🔗 LINK COUPLING: O hash agora inclui o link afiliado. Isso garante que:
+    - Mesma mensagem + link diferente = hash diferente (não deduplica)
+    - Mesma mensagem + mesmo link = hash igual (deduplica corretamente)
+    - Link é inseparável do hash
+    
+    Para OW: return_date é NULL (None → "NULL" na string)
+    Para link: se None, usa "NO_LINK" para retrocompatibilidade
+    
+    Retorna hexdigest SHA-256 para máxima estabilidade entre execuções.
+    """
+    provider_part = (provider or "UNKNOWN").upper()
+    return_part = return_date if return_date is not None else "NULL"
+    link_part = link if link else "NO_LINK"
+    raw_key = f"{provider_part}|{trip_type}|{origin}|{dest}|{depart_date}|{return_part}|{min_price}|{link_part}"
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+def should_check(origin: str, dest: str, trip_type: str, depart_date: str, return_date: Optional[str], db_path: Optional[str] = None) -> bool:
+    with _connect(db_path) as conn:
+        cur = conn.cursor()
+        # For OW: return_date is None, use IS NULL; for RT: use equality
+        if return_date is None:
+            cur.execute("""
+                SELECT cooldown_until FROM route_date_state
+                WHERE origin=? AND dest=? AND trip_type=? AND depart_date=? AND return_date IS NULL
+            """, (origin, dest, trip_type, depart_date))
+        else:
+            cur.execute("""
+                SELECT cooldown_until FROM route_date_state
+                WHERE origin=? AND dest=? AND trip_type=? AND depart_date=? AND return_date=?
+            """, (origin, dest, trip_type, depart_date, return_date))
+        row = cur.fetchone()
+    
+    if not row:
+        return True
+    cooldown_until = _dt_from_iso(row[0])
+    return datetime.datetime.now() >= cooldown_until
+
+def _upsert_state(origin: str, dest: str, trip_type: str, depart_date: str, return_date: Optional[str],
+                  status: str, best_price: Optional[int], cooldown_until: datetime.datetime, db_path: Optional[str] = None) -> None:
+    now = datetime.datetime.now()
+    with _connect(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO route_date_state(origin,dest,trip_type,depart_date,return_date,status,best_price,last_checked_at,cooldown_until)
+            VALUES(?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(origin,dest,trip_type,depart_date,return_date) DO UPDATE SET
+                status=excluded.status,
+                best_price=excluded.best_price,
+                last_checked_at=excluded.last_checked_at,
+                cooldown_until=excluded.cooldown_until
+        """, (origin, dest, trip_type, depart_date, return_date, status, best_price, _iso_from_dt(now), _iso_from_dt(cooldown_until)))
+        conn.commit()
+
+def mark_good(origin: str, dest: str, trip_type: str, depart_date: str, return_date: Optional[str], price: int, cooldown_days: int = 5, db_path: Optional[str] = None) -> None:
+    now = datetime.datetime.now()
+    cooldown = now + datetime.timedelta(days=cooldown_days)
+    _upsert_state(origin, dest, trip_type, depart_date, return_date, "GOOD", price, cooldown, db_path=db_path)
+
+def mark_bad(origin: str, dest: str, trip_type: str, depart_date: str, return_date: Optional[str], price: Optional[int], cooldown_hours: int = 36, db_path: Optional[str] = None) -> None:
+    now = datetime.datetime.now()
+    cooldown = now + datetime.timedelta(hours=cooldown_hours)
+    _upsert_state(origin, dest, trip_type, depart_date, return_date, "BAD", price, cooldown, db_path=db_path)
+
+def mark_no_data(origin: str, dest: str, trip_type: str, depart_date: str, return_date: Optional[str], cooldown_hours: int = 72, db_path: Optional[str] = None) -> None:
+    now = datetime.datetime.now()
+    cooldown = now + datetime.timedelta(hours=cooldown_hours)
+    _upsert_state(origin, dest, trip_type, depart_date, return_date, "NO_DATA", None, cooldown, db_path=db_path)
+
+def is_announced(offer_hash: str, db_path: Optional[str] = None) -> bool:
+    """Verifica se oferta (identificada por hash que INCLUI link) já foi anunciada."""
+    with _connect(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM announcements WHERE offer_hash=?", (offer_hash,))
+        row = cur.fetchone()
+    return row is not None
+
+def mark_announced(offer_hash: str, link: Optional[str] = None, db_path: Optional[str] = None, trip_type: Optional[str] = None) -> None:
+    """Marca oferta como anunciada, registrando hash + link para rastreabilidade.
+    Args:
+        offer_hash: Hash da oferta (inclui link internamente)
+        link: URL afiliada (registrada para auditoria/rastreamento)
+        db_path: Caminho do DB (default=DB_PATH)
+        trip_type: "OW" ou "RT" (opcional, default "OW")
+    🔗 Link é registrado explicitamente para nunca perder a rastreabilidade.
+    """
+    tipo = trip_type if trip_type else "OW"
+    with _connect(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT OR IGNORE INTO announcements (offer_hash, trip_type, created_at, link) VALUES (?, ?, ?, ?)",
+            (offer_hash, tipo, _now_iso(), link)
+        )
+        conn.commit()
+
+def is_under_cooldown_link(offer_hash: str, cooldown_hours: int = 24, db_path: Optional[str] = None) -> bool:
+    """🔗 LINK-BASED COOLDOWN: Evita spam da mesma passagem.
+    
+    Verifica se oferta identificada por offer_hash (que INCLUI link) foi anunciada
+    há menos de `cooldown_hours` atrás. Se sim, está em cooldown e não deve ser reempurrada.
+    
+    Modelo:
+    - Antes: cooldown por rota/data (route_date_state)
+    - Depois: cooldown por oferta/link (announcements + created_at)
+    
+    Benefícios:
+    ✓ Impede spam da mesma passagem com copy diferente
+    ✓ Bloqueia micro variações (mesma rota, +/- R$1)
+    ✓ Garante "essa oferta específica já foi empurrada"
+    
+    Args:
+        offer_hash: Hash com link acoplado
+        cooldown_hours: Janela de tempo (default 24h)
+        db_path: Caminho do DB
+    
+    Returns:
+        True se estava em cooldown (skip), False se pode enfileirar
+    """
+    with _connect(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT created_at FROM announcements WHERE offer_hash=?",
+            (offer_hash,)
+        )
+        row = cur.fetchone()
+    
+    if not row:
+        # Nunca foi anunciada, sem cooldown
+        return False
+    
+    created_at_str = row[0]
+    try:
+        created_at = _dt_from_iso(created_at_str)
+        now = datetime.datetime.now()
+        elapsed_hours = (now - created_at).total_seconds() / 3600
+        # Se passou menos de cooldown_hours, ainda em cooldown
+        return elapsed_hours < cooldown_hours
+    except Exception:
+        # Se erro ao parsear data, assume fora de cooldown (safe default)
+        return False
+
+def get_rt_avg_price(
+    origin: str,
+    dest: str,
+    min_samples: int = 10,
+    db_path: Optional[str] = None,
+) -> Optional[Tuple[int, int]]:
+    """Retorna (avg_price_int, samples) se tiver amostra suficiente (>= min_samples), senão None."""
+    with _connect(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT AVG(best_price), COUNT(*)
+            FROM route_date_state
+            WHERE origin=? AND dest=? AND trip_type='RT' AND status='GOOD' AND best_price IS NOT NULL
+            """,
+            (origin, dest),
+        )
+        row = cur.fetchone()
+
+    if not row:
+        return None
+
+    avg_price, samples = row[0], row[1]
+    if samples is None or samples < min_samples or avg_price is None:
+        return None
+
+    return int(round(avg_price)), int(samples)
+
+# ========================================
+
+def reset_all_state(db_path: Optional[str] = None, also_clear_announcements: bool = True) -> None:
+    """
+    Zera tabelas principais para recomeçar do zero.
+    Use com cuidado.
+    """
+    path = _get_db_path(db_path)
+    conn = sqlite3.connect(path)
+    cur = conn.cursor()
+    for table in ["route_date_state", "route_date_state_rt", "rt_price_history"]:
+        try:
+            cur.execute(f"DELETE FROM {table}")
+        except sqlite3.OperationalError:
+            pass  # ignora se a tabela não existir
+    if also_clear_announcements:
+        try:
+            cur.execute("DELETE FROM announcements")
+        except sqlite3.OperationalError:
+            pass
+    conn.commit()
+    conn.close()
+
+# ========== STUBS PARA COMPATIBILIDADE ==========
+
+def cleanup_expired_monitors(db_path: Optional[str] = None) -> int:
+    """Stub: Remove monitores expirados. MVP retorna 0."""
+    return 0
+
+def get_monitor_dates(origin: str, dest: str, trip_type: str, limit: int = 3, 
+                      min_interval_hours: int = 6, db_path: Optional[str] = None) -> list:
+    """Stub: Retorna datas monitoradas. MVP retorna lista vazia."""
+    return []
+
+def pick_dates_spread_with_cooldown(origin: str, dest: str, trip_type: str, start: datetime.date, 
+                                    days: int, k: int, db_path: Optional[str] = None) -> list:
+    """
+    Gera até k datas espalhadas no intervalo, priorizando quintas, sextas e sábados,
+    e filtrando por cooldown se necessário (stub: retorna todas por enquanto).
+    """
+    # Importa do módulo utilitário correto
+    from bot.date_discovery import smart_depart_dates
+    candidates = smart_depart_dates(start, days)
+    print(f"[DEBUG] pick_dates_spread_with_cooldown({origin}, {dest}, {trip_type}, {start}, {days}, {k}) => {candidates[:k]}")
+    return candidates[:k]
+
+def touch_monitor_checked(origin: str, dest: str, depart_date: str, trip_type: str, 
+                         db_path: Optional[str] = None) -> None:
+    """Stub: Marca monitor como checado. MVP faz nada."""
+    pass
+
+def touch_monitor_checked_rt(origin: str, dest: str, depart_date: str, return_date: str, 
+                            db_path: Optional[str] = None) -> None:
+    """Stub: Marca monitor RT como checado. MVP faz nada."""
+    pass
+
+def add_to_monitor(origin: str, dest: str, depart_date: str, trip_type: str = "OW", 
+                   monitor_days: int = 3, db_path: Optional[str] = None) -> None:
+    """Stub: Adiciona data ao monitor. MVP faz nada."""
+    pass
+
+def get_historical_avg_price(origin: str, dest: str, lookback_days: int = 60, 
+                            db_path: Optional[str] = None) -> Optional[int]:
+    """Stub: Retorna preço médio histórico. MVP retorna None."""
+    return None
+
+def get_historical_avg_price_rt(origin: str, dest: str, depart_date: datetime.date, 
+                                current_price: int, lookback_days: int = 30, 
+                                db_path: Optional[str] = None) -> Tuple[int, int, int, bool]:
+    """Stub: Retorna (avg, median, count, is_deal). MVP retorna (0, 0, 0, False)."""
+    return (0, 0, 0, False)

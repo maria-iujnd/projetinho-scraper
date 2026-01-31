@@ -1,0 +1,7 @@
+# Este arquivo é um lembrete para sempre incluir os arquivos reais de lógica e persistência no pacote/zip de deploy:
+# - routes_config.py
+# - state_store.py (com lógica real, não stub)
+# - whatsapp_sender.py
+# - message_queue.py
+#
+# Sem esses arquivos, o bot não funcionará corretamente em produção ou análise externa.

@@ -1,0 +1,10 @@
+price_nodes=213 ascended=9 valid=0
+len=415 :: Bagagem De mão Para despachar Conexões Ver tudo direto R$ 461 1 conexão R$ 1.036 2 conexões R$ 1.494 Horários Saída de Recife de dom 02:05 a dom 23:00 Chegada em São Paulo de dom 05:25 a seg 15:40 Linhas aéreas Ver tudo Azul R$ 498 GOL R$ 461 LATAM R$ 600 Aeroportos em: Recife Guararapes Intl R$ 461
+len=85 :: site oficial da GOL 03h20 21:20 REC 00:40 +1 GRU R$ 530 Ver oferta GOL Classic R$ 629
+len=1909 :: site oficial da GOL 03h20 21:20 REC 00:40 +1 GRU R$ 530 Ver oferta GOL Classic R$ 629 03h20 02:50 REC 06:10 GRU R$ 498 Ver oferta VaidePromo 9 ofertas mais 03h20 21:20 REC 00:40 +1 GRU R$ 530 Ver oferta GOL Classic R$ 629 9 ofertas mais 03h20 18:30 REC 21:50 GRU R$ 592 Ver oferta VaidePromo 9 oferta
+len=80 :: 03h20 21:20 REC 00:40 +1 GRU R$ 530 Ver oferta GOL Classic R$ 629 9 ofertas mais
+len=80 :: 03h20 21:20 REC 00:40 +1 GRU R$ 530 Ver oferta GOL Classic R$ 629 9 ofertas mais
+len=81 :: 03h20 04:00 REC 07:20 GRU R$ 1.038 Ver oferta GOL Classic R$ 1.137 9 ofertas mais
+len=81 :: 03h20 02:55 REC 06:15 CGH R$ 1.067 Ver oferta GOL Classic R$ 1.166 8 ofertas mais
+len=81 :: 03h25 18:50 REC 22:15 CGH R$ 1.067 Ver oferta GOL Classic R$ 1.166 9 ofertas mais
+len=88 :: 05h05 | 1 conexão 17:05 REC BSB 22:10 VCP R$ 1.222 Ver oferta Booking.com 6 ofertas mais

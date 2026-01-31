@@ -1,0 +1,16 @@
+{
+  "counts": {
+    "SCRAPE:BLOCKED_CHALLENGE": 3,
+    "SCRAPE:SELENIUM_EXCEPTION": 46
+  },
+  "queue": {
+    "total": 0,
+    "approved": 0,
+    "pending": 0,
+    "sent": 0,
+    "dropped": 0,
+    "top5_priorities": []
+  },
+  "duration": 9.490400791168213,
+  "timestamp": "2026-01-30T11:42:10"
+}

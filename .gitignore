@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.env
+*.db
+*.sqlite3
+# Debug/relatórios
+*.log
+debug_*
+boot_relatorio_*
+RESUMO_*
+FINAL_SUMMARY_*
+chrome_profile*
+kiwi_state.db
+queue_messages.json
